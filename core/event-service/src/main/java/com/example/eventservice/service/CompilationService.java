@@ -2,13 +2,12 @@ package com.example.eventservice.service;
 
 import com.example.eventservice.client.UserServiceClient;
 import com.example.eventservice.dto.CompilationDto;
-import com.example.eventservice.dto.EventShortDto;
 import com.example.eventservice.dto.NewCompilationDto;
 import com.example.eventservice.dto.UpdateCompilationRequest;
 import com.example.eventservice.dto.UserShortDto;
 import com.example.eventservice.exception.BadRequestException;
 import com.example.eventservice.exception.NotFoundException;
-import com.example.eventservice.mapper.EventMapper;
+import com.example.eventservice.mapper.CompilationMapper;
 import com.example.eventservice.model.Compilation;
 import com.example.eventservice.model.Event;
 import com.example.eventservice.repository.CompilationRepository;
@@ -31,7 +30,7 @@ public class CompilationService {
 
     private final CompilationRepository compilationRepository;
     private final EventRepository eventRepository;
-    private final EventMapper eventMapper;
+    private final CompilationMapper compilationMapper;
     private final UserServiceClient userServiceClient;
 
     @Transactional
@@ -96,16 +95,6 @@ public class CompilationService {
                 usersMap = users.stream().collect(Collectors.toMap(UserShortDto::getId, u -> u));
             }
         }
-        final Map<Long, UserShortDto> finalUsersMap = usersMap;
-        Set<EventShortDto> eventShorts = events == null ? Collections.emptySet() : events.stream()
-            .map(e -> eventMapper.toShortDto(e, finalUsersMap.getOrDefault(e.getInitiatorId(),
-                UserShortDto.builder().id(e.getInitiatorId()).name("").build())))
-            .collect(Collectors.toSet());
-        return CompilationDto.builder()
-            .id(compilation.getId())
-            .events(eventShorts)
-            .pinned(compilation.getPinned())
-            .title(compilation.getTitle())
-            .build();
+        return compilationMapper.toDto(compilation, usersMap);
     }
 }

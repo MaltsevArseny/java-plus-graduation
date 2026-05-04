@@ -33,6 +33,7 @@ import org.springframework.data.domain.Sort;
 import org.springframework.data.jpa.domain.Specification;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionTemplate;
 import ru.practicum.ewm.stats.client.AnalyzerClient;
 import ru.practicum.ewm.stats.client.CollectorClient;
 import ru.practicum.ewm.stats.proto.analyzer.RecommendedEventProto;
@@ -43,6 +44,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -59,6 +61,7 @@ public class EventService {
     private final RequestServiceClient requestServiceClient;
     private final CollectorClient collectorClient;
     private final AnalyzerClient analyzerClient;
+    private final TransactionTemplate transactionTemplate;
 
     public List<EventFullDto> getAllByAdmin(
         List<Long> users, List<String> states, List<Long> categories,
@@ -95,32 +98,35 @@ public class EventService {
             UserShortDto.builder().id(e.getInitiatorId()).name("").build()))).collect(Collectors.toList());
     }
 
-    @Transactional
     public EventFullDto updateByAdmin(Long eventId, UpdateEventRequest dto) {
-        Event event = eventRepository.findById(eventId)
-            .orElseThrow(() -> new NotFoundException("Event with id=" + eventId + " was not found"));
-        applyUpdate(event, dto);
-        if (dto.getStateAction() != null) {
-            if (dto.getStateAction() == StateAction.PUBLISH_EVENT) {
-                if (event.getState() != EventState.PENDING) {
-                    throw new ForbiddenOperationException("Cannot publish the event because it's not in the right state: " + event.getState());
+        Event event = Objects.requireNonNull(transactionTemplate.execute(status -> {
+            Event e = eventRepository.findById(eventId)
+                .orElseThrow(() -> new NotFoundException("Event with id=" + eventId + " was not found"));
+            applyUpdate(e, dto);
+            if (dto.getStateAction() != null) {
+                if (dto.getStateAction() == StateAction.PUBLISH_EVENT) {
+                    if (e.getState() != EventState.PENDING) {
+                        throw new ForbiddenOperationException("Cannot publish the event because it's not in the right state: " + e.getState());
+                    }
+                    if (e.getEventDate().isBefore(LocalDateTime.now().plusHours(1))) {
+                        throw new ForbiddenOperationException("Event date must be at least 1 hour from publication date");
+                    }
+                    e.setState(EventState.PUBLISHED);
+                    e.setPublishedOn(LocalDateTime.now());
+                } else if (dto.getStateAction() == StateAction.REJECT_EVENT) {
+                    if (e.getState() == EventState.PUBLISHED) {
+                        throw new ForbiddenOperationException("Cannot reject the event because it's already published");
+                    }
+                    e.setState(EventState.CANCELED);
                 }
-                if (event.getEventDate().isBefore(LocalDateTime.now().plusHours(1))) {
-                    throw new ForbiddenOperationException("Event date must be at least 1 hour from publication date");
-                }
-                event.setState(EventState.PUBLISHED);
-                event.setPublishedOn(LocalDateTime.now());
-            } else if (dto.getStateAction() == StateAction.REJECT_EVENT) {
-                if (event.getState() == EventState.PUBLISHED) {
-                    throw new ForbiddenOperationException("Cannot reject the event because it's already published");
-                }
-                event.setState(EventState.CANCELED);
             }
-        }
-        if (dto.getEventDate() != null && dto.getEventDate().isBefore(LocalDateTime.now().plusHours(1))) {
-            throw new BadRequestException("Event date must be at least 1 hour from now");
-        }
-        event = eventRepository.save(event);
+            if (dto.getEventDate() != null && dto.getEventDate().isBefore(LocalDateTime.now().plusHours(1))) {
+                throw new BadRequestException("Event date must be at least 1 hour from now");
+            }
+            Event saved = eventRepository.save(e);
+            saved.getCategory().getId(); // initialize lazy proxy before session closes
+            return saved;
+        }));
         UserShortDto initiator = userServiceClient.getById(event.getInitiatorId());
         return eventMapper.toFullDto(event, initiator);
     }
@@ -131,35 +137,37 @@ public class EventService {
         return events.stream().map(e -> eventMapper.toShortDto(e, initiator)).collect(Collectors.toList());
     }
 
-    @Transactional
     public EventFullDto create(Long userId, NewEventDto dto) {
         UserShortDto user = userServiceClient.getById(userId);
         if (user == null || user.getId() == null) {
             throw new NotFoundException("User with id=" + userId + " was not found");
         }
-        Category category = categoryRepository.findById(dto.getCategory())
-            .orElseThrow(() -> new NotFoundException("Category with id=" + dto.getCategory() + " was not found"));
         if (dto.getEventDate() != null && dto.getEventDate().isBefore(LocalDateTime.now().plusHours(2))) {
             throw new BadRequestException("Event date must be at least 2 hours from now");
         }
-        Event event = Event.builder()
-            .annotation(dto.getAnnotation())
-            .category(category)
-            .confirmedRequests(0L)
-            .createdOn(LocalDateTime.now())
-            .description(dto.getDescription())
-            .eventDate(dto.getEventDate())
-            .initiatorId(userId)
-            .lat(dto.getLocation() != null ? dto.getLocation().getLat() : null)
-            .lon(dto.getLocation() != null ? dto.getLocation().getLon() : null)
-            .paid(dto.getPaid() != null ? dto.getPaid() : false)
-            .participantLimit(dto.getParticipantLimit() != null ? dto.getParticipantLimit() : 0)
-            .requestModeration(dto.getRequestModeration() != null ? dto.getRequestModeration() : true)
-            .state(EventState.PENDING)
-            .title(dto.getTitle())
-            .rating(0.0)
-            .build();
-        return eventMapper.toFullDto(eventRepository.save(event), user);
+        Event event = Objects.requireNonNull(transactionTemplate.execute(status -> {
+            Category category = categoryRepository.findById(dto.getCategory())
+                .orElseThrow(() -> new NotFoundException("Category with id=" + dto.getCategory() + " was not found"));
+            Event e = Event.builder()
+                .annotation(dto.getAnnotation())
+                .category(category)
+                .confirmedRequests(0L)
+                .createdOn(LocalDateTime.now())
+                .description(dto.getDescription())
+                .eventDate(dto.getEventDate())
+                .initiatorId(userId)
+                .lat(dto.getLocation() != null ? dto.getLocation().getLat() : null)
+                .lon(dto.getLocation() != null ? dto.getLocation().getLon() : null)
+                .paid(dto.getPaid() != null ? dto.getPaid() : false)
+                .participantLimit(dto.getParticipantLimit() != null ? dto.getParticipantLimit() : 0)
+                .requestModeration(dto.getRequestModeration() != null ? dto.getRequestModeration() : true)
+                .state(EventState.PENDING)
+                .title(dto.getTitle())
+                .rating(0.0)
+                .build();
+            return eventRepository.save(e);
+        }));
+        return eventMapper.toFullDto(event, user);
     }
 
     public EventFullDto getByIdAndUser(Long userId, Long eventId) {
@@ -169,22 +177,25 @@ public class EventService {
         return eventMapper.toFullDto(event, initiator);
     }
 
-    @Transactional
     public EventFullDto updateByUser(Long userId, Long eventId, UpdateEventRequest dto) {
-        Event event = eventRepository.findByIdAndInitiatorId(eventId, userId)
-            .orElseThrow(() -> new NotFoundException("Event with id=" + eventId + " was not found"));
-        if (event.getState() == EventState.PUBLISHED) {
-            throw new ForbiddenOperationException("Only pending or canceled events can be changed");
-        }
-        if (dto.getEventDate() != null && dto.getEventDate().isBefore(LocalDateTime.now().plusHours(2))) {
-            throw new BadRequestException("Event date must be at least 2 hours from now");
-        }
-        applyUpdate(event, dto);
-        if (dto.getStateAction() != null) {
-            if (dto.getStateAction() == StateAction.SEND_TO_REVIEW) event.setState(EventState.PENDING);
-            else if (dto.getStateAction() == StateAction.CANCEL_REVIEW) event.setState(EventState.CANCELED);
-        }
-        event = eventRepository.save(event);
+        Event event = Objects.requireNonNull(transactionTemplate.execute(status -> {
+            Event e = eventRepository.findByIdAndInitiatorId(eventId, userId)
+                .orElseThrow(() -> new NotFoundException("Event with id=" + eventId + " was not found"));
+            if (e.getState() == EventState.PUBLISHED) {
+                throw new ForbiddenOperationException("Only pending or canceled events can be changed");
+            }
+            if (dto.getEventDate() != null && dto.getEventDate().isBefore(LocalDateTime.now().plusHours(2))) {
+                throw new BadRequestException("Event date must be at least 2 hours from now");
+            }
+            applyUpdate(e, dto);
+            if (dto.getStateAction() != null) {
+                if (dto.getStateAction() == StateAction.SEND_TO_REVIEW) e.setState(EventState.PENDING);
+                else if (dto.getStateAction() == StateAction.CANCEL_REVIEW) e.setState(EventState.CANCELED);
+            }
+            Event saved = eventRepository.save(e);
+            saved.getCategory().getId(); // initialize lazy proxy before session closes
+            return saved;
+        }));
         UserShortDto initiator = userServiceClient.getById(userId);
         return eventMapper.toFullDto(event, initiator);
     }
@@ -271,7 +282,6 @@ public class EventService {
             .collect(Collectors.toList());
     }
 
-    @Transactional
     public void likeEvent(Long userId, Long eventId) {
         Event event = eventRepository.findByIdAndState(eventId, EventState.PUBLISHED)
             .orElseThrow(() -> new NotFoundException("Event with id=" + eventId + " was not found"));
@@ -292,7 +302,6 @@ public class EventService {
         return requestServiceClient.getByEventId(eventId);
     }
 
-    @Transactional
     public EventRequestStatusUpdateResult updateRequestStatus(
         Long userId, Long eventId, EventRequestStatusUpdateRequest dto
     ) {
@@ -311,14 +320,19 @@ public class EventService {
             throw new ConditionsNotMetException("The participant limit has been reached");
         }
 
+        // External call outside transaction
         EventRequestStatusUpdateResult result = requestServiceClient.updateStatuses(
             eventId, event.getParticipantLimit(), event.getConfirmedRequests(), dto
         );
 
         long newlyConfirmed = result.getConfirmedRequests() != null ? result.getConfirmedRequests().size() : 0;
         if (newlyConfirmed > 0) {
-            event.setConfirmedRequests(event.getConfirmedRequests() + newlyConfirmed);
-            eventRepository.save(event);
+            final long confirmed = newlyConfirmed;
+            transactionTemplate.executeWithoutResult(status -> {
+                Event e = eventRepository.findById(eventId).orElseThrow();
+                e.setConfirmedRequests(e.getConfirmedRequests() + confirmed);
+                eventRepository.save(e);
+            });
         }
         return result;
     }
